@@ -1,140 +1,132 @@
-import google.auth
+from typing import List
+
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from OAuth import authentication
 import base64
-import quopri
-import os
+from gmail_structures import Thread, Message
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 
-def create_thread(id, messages):    
-    return {
-        "id" : "",
-        "messages" : messages
-    }
 
-def create_message(id, headers, body,attachment, labelsID):
-    # Header Structure
-    # {
-    #         "Subject": subject,
-    #         "Cc": cc,
-    #         "Date": date,
-    #         "From": from_email,
-    #         "To": to
-    #     }
-    return {
-        "id": id,
-        "headers": headers,
-        "labelsIds" : labelsID,
-        "body": body,
-        "attachment": None
-    }
+class GmailClient:
+    def __init__(self, credentials):
+        self.service = build("gmail", "v1", credentials=credentials)
+        self.threads = {}  # Store the thread_id : Thread
 
-threads = []
+    # Todo this need to be checked
+    def fetch_threads(self, user_id, maximum_mails=-1):
+        """Retrieve a list of threads."""
+        count = 100
+        fetched_mails = 0
+        page_token = None
 
-def show_chatty_threads():
-#   creds, _ = google.auth.default()
-    creds = authentication(SCOPES)
-    try:
-        service = build("gmail", "v1", credentials=creds)
-        threads = service.users().threads().list(userId="me").execute().get("threads", [])
-        for thread in threads:
-            messages = []
-            tdata = service.users().threads().get(userId="me", id=thread["id"]).execute()
-            for message in tdata["messages"]:                
-                                             
-                msgHeader = {}
-                payload = message["payload"]
-                headers = payload["headers"]
+        while True:
+            if maximum_mails != -1 and fetched_mails + count > maximum_mails:
+                count = maximum_mails - fetched_mails
 
-                for header in headers:
-                    if header["name"] in ["Subject", "To", "Cc", "Date", "From"]:
-                        msgHeader[header["name"]] = header["value"]
-                body = ""
-                if "parts" in payload:
-                    for part in payload["parts"]:
-                        body = decode(part, service, message['id'])
+            response = self.service.users().threads().list(userId=user_id, maxResults=count,
+                                                           pageToken=page_token).execute()
+            threads = response.get('threads', [])
 
-                messages.append(create_message(message["id"], msgHeader, body, message["labelIDs"] ))
-                
-            break
-    except HttpError as error:
-        print(f"An error occurred: {error}")
+            for thread in threads:
+                self.threads[thread['id']] = Thread(thread_id=thread['id'], history_id=thread['historyId'], messages=[])
 
+            fetched_mails += len(threads)
 
-def decode(part, service=None, message_id=None):
-    # Check for nested parts (e.g., in multipart messages)
-    if "parts" in part:
-        for sub_part in part["parts"]:
-            decode(sub_part, service, message_id)  # Recursively decode parts
-        return
-    msgAttachment = None
-    if "body" in part and ("data" in part["body"] or "attachmentId" in part["body"]):
-        if "data" in part["body"]:
-            data = part["body"]["data"]
-        else:  # Fetch attachment if there's an attachmentId instead of inline data
-            if service and message_id:                
-                attachment = service.users().messages().attachments().get(userId='me', messageId=message_id, id=part["body"]["attachmentId"]).execute()
-                data = attachment["data"]
-                msgAttachment = {
-                    "filename": part["filename"],
-                    "mimeType": part["mimeType"],     
-                    "data": None               
-                }
-            else:
-                return "No service or message ID provided for attachment retrieval."
-    else:
-        return "No data or attachment ID found in part."
+            page_token = response.get('nextPageToken')
+            if not page_token or (maximum_mails != -1 and fetched_mails >= maximum_mails):
+                break
 
-    # Determine if the part is textual or binary based on MIME type
-    is_text = part["mimeType"].startswith("text/")
+    # Todo this need to be checked
+    def fetch_thread_messages(self, user_id, thread_id, history_id=None):
+        """Retrieve all messages within a thread."""
+        thread_data = None
+        if history_id and history_id > self.threads[thread_id].history_id:
+            thread_data = self.service.users().messages().get(userId=user_id,
+                                                              id=thread_id, q='after:' + history_id).execute()
+        else:
+            thread_data = self.service.users().messages().get(userId=user_id, id=thread_id).execute()
+        return thread_data['messages']
 
-    # Determine encoding
-    encoding = None
-    for header in part["headers"]:
-        if header["name"].lower() == "content-transfer-encoding":
-            encoding = header["value"]
-            break
+    def get_full_message(self, user_id, msg_id):
+        """Retrieve the full message content for a given message ID."""
+        message = self.service.users().messages().get(userId=user_id, id=msg_id, format='full').execute()
+        return message
 
-    # Decode data
-    decoded_data = decode_data(data, encoding, is_text)
+    def extract_message_headers(self, message):
+        """Extract relevant headers from a message."""
+        headers = message['payload']['headers']
+        subject = ""
+        from_email = ""
+        date = ""
+        cc = ""
+        bcc = ""
 
-    # Handle image saving
-    if part["mimeType"].startswith("image/"):
-        # Assuming you want to save the image in the current working directory with a filename derived from the partId
-        filename = f"{part['partId'].replace('.', '_')}.png"  # Customize this line as needed
-        msgAttachment["data"] = decode_data
-        with open(filename, "wb") as img_file:
-            img_file.write(decoded_data)
-        print(f"Image saved as {filename}")
-        return
+        for header in headers:
+            if header['name'] == 'Subject':
+                subject = header['value']
+            elif header['name'] == 'From':
+                from_email = header['value']
+            elif header['name'] == 'Date':
+                date = header['value']
+            elif header['name'] == 'Cc':
+                cc = header['value']
+            elif header['name'] == 'Bcc':
+                bcc = header['value']
 
-    return (decode_data, msgAttachment)
-  
+        return subject, from_email, date, cc, bcc
 
-# The decode_data function and other parts of the script remain the same.
+    def get_message_body(self, message):
+        """Decode the message body."""
+        if 'data' in message['payload']['parts'][0]['body']:
+            body_data = message['payload']['parts'][0]['body']['data']
+            body = base64.urlsafe_b64decode(body_data).decode('utf-8')
+        else:
+            body = "No body content found."
+        return body
 
-def decode_data(encoded_data, encoding, is_text):
-    # Decode the data
-    if encoding == "base64":
-        decoded_data = base64.urlsafe_b64decode(encoded_data + '===')
-    elif encoding == "quoted-printable":
-        decoded_data = quopri.decodestring(base64.urlsafe_b64decode(encoded_data + '==='))
-    else:
-        decoded_data = encoded_data
+    def print_message_details(self, message: Message):
+        """Print the message details systematically."""
+        print(f"  From: {message.from_email}")
+        print(f"  Subject: {message.subject}")
+        print(f"  Date: {message.date}")
+        print(f"  Cc: {message.cc}")
+        print(f"  Bcc: {message.bcc}")
+        print(f"  Full Message:\n{message.body}")
+        print("-" * 50)  # Separator for readability
 
-    # If the content is textual, convert it to a string
-    if is_text:
-        try:
-            return decoded_data.decode('utf-8')
-        except UnicodeDecodeError:
-            print("Error decoding text data; it may not be UTF-8 encoded.")
-            return None  # Or handle the error as appropriate for your needs
-    else:
-        # For non-text content, return the binary data directly
-        return decoded_data
- # Return bytes for binary data
+    def fetch_all_messages_from_threads(self, user_id):
+        """Retrieve and print all messages from threads."""
+        self.fetch_threads(user_id)
+
+        if not self.threads:
+            print("No threads found.")
+            return
+
+        for thread in self.threads:
+            thread_id = thread['id']
+            history_id = thread['historyId']
+            messages = self.fetch_thread_messages(user_id, thread_id)
+
+            thread_data = Thread(thread_id=thread_id, history_id=history_id, messages=[])
+
+            for message in messages:
+                msg_id = message['id']
+                full_message = self.get_full_message(user_id, msg_id)
+                subject, from_email, date, cc, bcc = self.extract_message_headers(full_message)
+                body = self.get_message_body(full_message)
+
+                # Create a Message object and append it to the Thread
+                message_obj = Message(from_email=from_email, subject=subject, date=date, cc=cc, bcc=bcc, body=body)
+                thread_data.messages.append(message_obj)
+
+            self.threads.append(thread_data)
+
 
 if __name__ == "__main__":
-    show_chatty_threads()
+    creds = authentication(SCOPES)
+    gmail_client = GmailClient(creds)
+
+    # Call the function to get all messages from threads
+    # gmail_client.get_all_messages_from_threads("me")
+
