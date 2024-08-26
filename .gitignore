@@ -1,3 +1,7 @@
 token.json
 cv2\ project\ data/**
 __pycache__/**
+credentials.json
+.vscode/
+.idea/
+.DS_Store
